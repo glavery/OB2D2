@@ -1,6 +1,6 @@
 import { McpServer } from "npm:@modelcontextprotocol/sdk@1.24.3/server/mcp.js";
 import { Hono } from "npm:hono@4.9.2";
-import { z } from "npm:zod@4.1.13";
+import { z } from "npm:zod@3.23.8";
 import postgres from "npm:postgres@3.4.5";
 import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
 
