@@ -1,221 +1,118 @@
-import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { McpServer } from "npm:@modelcontextprotocol/sdk@1.24.3/server/mcp.js";
+import { Hono } from "npm:hono@4.9.2";
+import { z } from "npm:zod@3.23.8";
+import postgres from "npm:postgres@3.4.5";
+import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPTransport } from "@hono/mcp";
-import { Hono } from "hono";
-import { z } from "zod";
-import { createClient } from "@supabase/supabase-js";
+// --- Load environment ---
+const env = await load({ envPath: ".env" });
+const get = (k: string) => env[k] || Deno.env.get(k) || "";
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
-const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
+const DATABASE_URL = get("DATABASE_URL");
+const OLLAMA_URL = get("OLLAMA_URL") || "http://localhost:11434";
+const EMBEDDING_MODEL = get("EMBEDDING_MODEL") || "mxbai-embed-large";
+const METADATA_MODEL = get("METADATA_MODEL") || "phi3:mini";
+const MCP_ACCESS_KEY = get("MCP_ACCESS_KEY");
+const MCP_PORT = parseInt(get("MCP_PORT") || "3333");
+const SERVER_START = Date.now();
 
-const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+if (!DATABASE_URL) throw new Error("DATABASE_URL is required in .env");
+if (!MCP_ACCESS_KEY) throw new Error("MCP_ACCESS_KEY is required in .env");
 
-type ThoughtMatch = {
-  id: string;
-  content: string;
-  metadata: Record<string, unknown>;
-  similarity: number;
-  created_at: string;
-};
+// --- Database ---
+const sql = postgres(DATABASE_URL);
 
-type ThoughtRecord = {
-  id: string;
-  content: string;
-  metadata: Record<string, unknown>;
-  created_at: string;
-  updated_at?: string | null;
-};
-
-const CITATION_BASE_URL =
-  Deno.env.get("OPEN_BRAIN_CITATION_BASE_URL") || "https://openbrain.local/thoughts";
-
-function thoughtTitle(content: string, createdAt?: string): string {
-  const firstLine = content.replace(/\s+/g, " ").trim().slice(0, 80);
-  const datePrefix = createdAt ? new Date(createdAt).toLocaleDateString() : "Open Brain";
-  return firstLine ? `${datePrefix} - ${firstLine}` : `${datePrefix} thought`;
-}
-
-function thoughtUrl(id: string): string {
-  return `${CITATION_BASE_URL.replace(/\/$/, "")}/${id}`;
-}
-
+// --- Ollama helpers ---
 async function getEmbedding(text: string): Promise<number[]> {
-  const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+  const r = await fetch(`${OLLAMA_URL}/api/embed`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "openai/text-embedding-3-small",
-      input: text,
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
   });
   if (!r.ok) {
     const msg = await r.text().catch(() => "");
-    throw new Error(`OpenRouter embeddings failed: ${r.status} ${msg}`);
+    throw new Error(`Ollama embedding failed: ${r.status} ${msg}`);
   }
   const d = await r.json();
-  return d.data[0].embedding;
+  return d.embeddings[0];
+}
+
+// --- Metadata validation ---
+const VALID_TYPES = new Set(["observation", "task", "idea", "reference", "person_note", "system_config"]);
+
+function validateMetadata(raw: Record<string, unknown>): Record<string, unknown> {
+  return {
+    type: VALID_TYPES.has(raw.type as string) ? raw.type : "observation",
+    topics: (() => {
+      if (Array.isArray(raw.topics) && raw.topics.length > 0) {
+        const valid = raw.topics.filter((t): t is string => typeof t === "string" && t.trim().length > 0).slice(0, 5);
+        return valid.length > 0 ? valid : ["uncategorized"];
+      }
+      return ["uncategorized"];
+    })(),
+    people: Array.isArray(raw.people)
+      ? raw.people.filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+      : [],
+    action_items: Array.isArray(raw.action_items)
+      ? raw.action_items.filter((a): a is string => typeof a === "string" && a.trim().length > 0)
+      : [],
+    dates_mentioned: Array.isArray(raw.dates_mentioned)
+      ? raw.dates_mentioned.filter((d): d is string => typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d))
+      : [],
+  };
 }
 
 async function extractMetadata(text: string): Promise<Record<string, unknown>> {
-  const r = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: `Extract metadata from the user's captured thought. Return JSON with:
-- "people": array of people mentioned (empty if none)
-- "action_items": array of implied to-dos (empty if none)
-- "dates_mentioned": array of dates YYYY-MM-DD (empty if none)
+  try {
+    const r = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: METADATA_MODEL,
+        stream: false,
+        format: "json",
+        messages: [
+          {
+            role: "system",
+            content: `Extract metadata from the user's captured thought. Return JSON with:
+- "people": array of people mentioned (empty array if none)
+- "action_items": array of implied to-dos (empty array if none)
+- "dates_mentioned": array of dates YYYY-MM-DD (empty array if none)
 - "topics": array of 1-3 short topic tags (always at least one)
 - "type": one of "observation", "task", "idea", "reference", "person_note"
-Only extract what's explicitly there.`,
-        },
-        { role: "user", content: text },
-      ],
-    }),
-  });
-  const d = await r.json();
-  try {
-    return JSON.parse(d.choices[0].message.content);
+Return ONLY valid JSON. No extra text.`,
+          },
+          { role: "user", content: text },
+        ],
+      }),
+    });
+    const d = await r.json();
+    const parsed = JSON.parse(d.message.content);
+    return validateMetadata(parsed);
   } catch {
-    return { topics: ["uncategorized"], type: "observation" };
+    return { topics: ["uncategorized"], type: "observation", people: [], action_items: [], dates_mentioned: [] };
   }
 }
 
-// --- MCP Server Setup ---
+// --- Fingerprint helper ---
+async function fingerprint(text: string): Promise<string> {
+  const normalized = text.toLowerCase().trim().replace(/\s+/g, " ");
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(normalized));
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 
-const server = new McpServer({
-  name: "open-brain",
-  version: "1.0.0",
-});
+// =====================================================================
+// MCP Server — 6 Tools
+// =====================================================================
 
-// ChatGPT compatibility: restricted connector surfaces, company knowledge, and deep
-// research look for exact read-only `search` and `fetch` tool shapes.
-server.registerTool(
-  "search",
-  {
-    title: "Search Open Brain",
-    description:
-      "Search Open Brain memories by meaning. Use this read-only compatibility tool when ChatGPT needs search/fetch-style access to stored thoughts.",
-    annotations: {
-      readOnlyHint: true,
-    },
-    inputSchema: {
-      query: z.string().describe("The search query to run against Open Brain thoughts"),
-    },
-  },
-  async ({ query }) => {
-    try {
-      const qEmb = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_thoughts", {
-        query_embedding: qEmb,
-        match_threshold: 0.5,
-        match_count: 10,
-        filter: {},
-      });
-
-      if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Search error: ${error.message}` }],
-          isError: true,
-        };
-      }
-
-      const results = ((data || []) as ThoughtMatch[]).map((t) => ({
-        id: t.id,
-        title: thoughtTitle(t.content, t.created_at),
-        url: thoughtUrl(t.id),
-      }));
-
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify({ results }) }],
-      };
-    } catch (err: unknown) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
-
-server.registerTool(
-  "fetch",
-  {
-    title: "Fetch Open Brain Thought",
-    description:
-      "Fetch one Open Brain thought by ID after using search. Use this read-only compatibility tool to retrieve the full text and metadata for citation.",
-    annotations: {
-      readOnlyHint: true,
-    },
-    inputSchema: {
-      id: z.string().describe("The Open Brain thought ID returned by the search tool"),
-    },
-  },
-  async ({ id }) => {
-    try {
-      const { data, error } = await supabase
-        .from("thoughts")
-        .select("id, content, metadata, created_at, updated_at")
-        .eq("id", id)
-        .single();
-
-      if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Fetch error: ${error.message}` }],
-          isError: true,
-        };
-      }
-
-      const thought = data as ThoughtRecord;
-      const document = {
-        id: thought.id,
-        title: thoughtTitle(thought.content, thought.created_at),
-        text: thought.content,
-        url: thoughtUrl(thought.id),
-        metadata: {
-          ...thought.metadata,
-          created_at: thought.created_at,
-          updated_at: thought.updated_at,
-        },
-      };
-
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(document) }],
-      };
-    } catch (err: unknown) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
-    }
-  }
-);
+const server = new McpServer({ name: "ob2d2", version: "1.1.0-local" });
 
 // Tool 1: Semantic Search
 server.registerTool(
   "search_thoughts",
   {
     title: "Search Thoughts",
-    description:
-      "Search captured thoughts by meaning. Use this when the user asks about a topic, person, or idea they've previously captured.",
-    annotations: {
-      readOnlyHint: true,
-    },
+    description: "Search captured thoughts by meaning.",
     inputSchema: {
       query: z.string().describe("What to search for"),
       limit: z.number().optional().default(10),
@@ -225,61 +122,39 @@ server.registerTool(
   async ({ query, limit, threshold }) => {
     try {
       const qEmb = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_thoughts", {
-        query_embedding: qEmb,
-        match_threshold: threshold,
-        match_count: limit,
-        filter: {},
+      const vecStr = `[${qEmb.join(",")}]`;
+      const rows = await sql`
+        SELECT id, content, metadata,
+               (1 - (embedding <=> ${vecStr}::vector)) AS similarity,
+               created_at
+        FROM thoughts
+        WHERE 1 - (embedding <=> ${vecStr}::vector) > ${threshold}
+        ORDER BY embedding <=> ${vecStr}::vector
+        LIMIT ${limit}
+      `;
+
+      if (rows.length === 0) {
+        return { content: [{ type: "text" as const, text: `No thoughts found matching "${query}".` }] };
+      }
+
+      const results = rows.map((t, i) => {
+        const m = (t.metadata || {}) as Record<string, unknown>;
+        const parts = [
+          `--- Result ${i + 1} (${(Number(t.similarity) * 100).toFixed(1)}% match) ---`,
+          `ID: ${t.id}`,
+          `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
+          `Type: ${m.type || "unknown"}`,
+        ];
+        if (Array.isArray(m.topics) && m.topics.length) parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
+        if (Array.isArray(m.people) && m.people.length) parts.push(`People: ${(m.people as string[]).join(", ")}`);
+        if (Array.isArray(m.action_items) && m.action_items.length) parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
+        parts.push(`\n${t.content}`);
+        return parts.join("\n");
       });
 
-      if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Search error: ${error.message}` }],
-          isError: true,
-        };
-      }
-
-      if (!data || data.length === 0) {
-        return {
-          content: [{ type: "text" as const, text: `No thoughts found matching "${query}".` }],
-        };
-      }
-
-      const results = data.map(
-        (
-          t: ThoughtMatch,
-          i: number
-        ) => {
-          const m = t.metadata || {};
-          const parts = [
-            `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) ---`,
-            `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
-            `Type: ${m.type || "unknown"}`,
-          ];
-          if (Array.isArray(m.topics) && m.topics.length)
-            parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
-          if (Array.isArray(m.people) && m.people.length)
-            parts.push(`People: ${(m.people as string[]).join(", ")}`);
-          if (Array.isArray(m.action_items) && m.action_items.length)
-            parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
-          parts.push(`\n${t.content}`);
-          return parts.join("\n");
-        }
-      );
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Found ${data.length} thought(s):\n\n${results.join("\n\n")}`,
-          },
-        ],
-      };
+      return { content: [{ type: "text" as const, text: `Found ${rows.length} thought(s):\n\n${results.join("\n\n")}` }] };
     } catch (err: unknown) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
   }
 );
@@ -289,147 +164,87 @@ server.registerTool(
   "list_thoughts",
   {
     title: "List Recent Thoughts",
-    description:
-      "List recently captured thoughts with optional filters by type, topic, person, or time range.",
-    annotations: {
-      readOnlyHint: true,
-    },
+    description: "List recently captured thoughts with optional filters.",
     inputSchema: {
       limit: z.number().optional().default(10),
-      type: z.string().optional().describe("Filter by type: observation, task, idea, reference, person_note"),
+      type: z.string().optional().describe("Filter by type"),
       topic: z.string().optional().describe("Filter by topic tag"),
-      person: z.string().optional().describe("Filter by person mentioned"),
-      days: z.number().optional().describe("Only thoughts from the last N days"),
+      person: z.string().optional().describe("Filter by person"),
+      days: z.number().optional().describe("Only thoughts from last N days"),
     },
   },
   async ({ limit, type, topic, person, days }) => {
     try {
-      let q = supabase
-        .from("thoughts")
-        .select("content, metadata, created_at")
-        .order("created_at", { ascending: false })
-        .limit(limit);
+      let query = `SELECT id, content, metadata, created_at FROM thoughts WHERE 1=1`;
+      const params: unknown[] = [];
+      let idx = 0;
 
-      if (type) q = q.contains("metadata", { type });
-      if (topic) q = q.contains("metadata", { topics: [topic] });
-      if (person) q = q.contains("metadata", { people: [person] });
+      if (type) { idx++; query += ` AND metadata->>'type' = $${idx}`; params.push(type); }
+      if (topic) { idx++; query += ` AND metadata->'topics' ? $${idx}`; params.push(topic); }
+      if (person) { idx++; query += ` AND metadata->'people' ? $${idx}`; params.push(person); }
       if (days) {
+        idx++;
         const since = new Date();
         since.setDate(since.getDate() - days);
-        q = q.gte("created_at", since.toISOString());
+        query += ` AND created_at >= $${idx}`;
+        params.push(since.toISOString());
       }
+      idx++;
+      query += ` ORDER BY created_at DESC LIMIT $${idx}`;
+      params.push(limit);
 
-      const { data, error } = await q;
+      const rows = await sql.unsafe(query, params as never[]);
 
-      if (error) {
-        return {
-          content: [{ type: "text" as const, text: `Error: ${error.message}` }],
-          isError: true,
-        };
-      }
-
-      if (!data || !data.length) {
+      if (rows.length === 0) {
         return { content: [{ type: "text" as const, text: "No thoughts found." }] };
       }
 
-      const results = data.map(
-        (
-          t: { content: string; metadata: Record<string, unknown>; created_at: string },
-          i: number
-        ) => {
-          const m = t.metadata || {};
-          const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
-        }
-      );
+      const results = rows.map((t, i) => {
+        const m = (t.metadata || {}) as Record<string, unknown>;
+        const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
+        return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""}) ID: ${t.id}\n   ${t.content}`;
+      });
 
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `${data.length} recent thought(s):\n\n${results.join("\n\n")}`,
-          },
-        ],
-      };
+      return { content: [{ type: "text" as const, text: `${rows.length} recent thought(s):\n\n${results.join("\n\n")}` }] };
     } catch (err: unknown) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
   }
 );
 
-// Tool 3: Stats
+// Tool 3: Stats (SQL-based)
 server.registerTool(
   "thought_stats",
   {
     title: "Thought Statistics",
-    description: "Get a summary of all captured thoughts: totals, types, top topics, and people.",
-    annotations: {
-      readOnlyHint: true,
-    },
+    description: "Get a summary of all captured thoughts.",
     inputSchema: {},
   },
   async () => {
     try {
-      const { count } = await supabase
-        .from("thoughts")
-        .select("*", { count: "exact", head: true });
-
-      const { data } = await supabase
-        .from("thoughts")
-        .select("metadata, created_at")
-        .order("created_at", { ascending: false });
-
-      const types: Record<string, number> = {};
-      const topics: Record<string, number> = {};
-      const people: Record<string, number> = {};
-
-      for (const r of data || []) {
-        const m = (r.metadata || {}) as Record<string, unknown>;
-        if (m.type) types[m.type as string] = (types[m.type as string] || 0) + 1;
-        if (Array.isArray(m.topics))
-          for (const t of m.topics) topics[t as string] = (topics[t as string] || 0) + 1;
-        if (Array.isArray(m.people))
-          for (const p of m.people) people[p as string] = (people[p as string] || 0) + 1;
-      }
-
-      const sort = (o: Record<string, number>): [string, number][] =>
-        Object.entries(o)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 10);
+      const [result] = await sql`SELECT thought_stats_summary() AS stats`;
+      const s = result.stats as {
+        total: number; earliest: string | null; latest: string | null;
+        types: Record<string, number>; topics: Record<string, number>; people: Record<string, number>;
+      };
 
       const lines: string[] = [
-        `Total thoughts: ${count}`,
-        `Date range: ${
-          data?.length
-            ? new Date(data[data.length - 1].created_at).toLocaleDateString() +
-              " → " +
-              new Date(data[0].created_at).toLocaleDateString()
-            : "N/A"
-        }`,
-        "",
-        "Types:",
-        ...sort(types).map(([k, v]) => `  ${k}: ${v}`),
+        `Total thoughts: ${s.total}`,
+        `Date range: ${s.earliest ? new Date(s.earliest).toLocaleDateString() + " → " + new Date(s.latest!).toLocaleDateString() : "N/A"}`,
+        "", "Types:",
+        ...Object.entries(s.types).map(([k, v]) => `  ${k}: ${v}`),
       ];
-
-      if (Object.keys(topics).length) {
+      if (Object.keys(s.topics).length) {
         lines.push("", "Top topics:");
-        for (const [k, v] of sort(topics)) lines.push(`  ${k}: ${v}`);
+        for (const [k, v] of Object.entries(s.topics)) lines.push(`  ${k}: ${v}`);
       }
-
-      if (Object.keys(people).length) {
+      if (Object.keys(s.people).length) {
         lines.push("", "People mentioned:");
-        for (const [k, v] of sort(people)) lines.push(`  ${k}: ${v}`);
+        for (const [k, v] of Object.entries(s.people)) lines.push(`  ${k}: ${v}`);
       }
-
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     } catch (err: unknown) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
   }
 );
@@ -439,16 +254,9 @@ server.registerTool(
   "capture_thought",
   {
     title: "Capture Thought",
-    description:
-      "Save a new thought to the Open Brain. Generates an embedding and extracts metadata automatically. Use this when the user wants to save something to their brain directly from any AI client — notes, insights, decisions, or migrated content from other systems.",
-    annotations: {
-      readOnlyHint: false,
-      openWorldHint: false,
-      destructiveHint: false,
-      idempotentHint: false,
-    },
+    description: "Save a new thought. Generates embedding and extracts metadata automatically.",
     inputSchema: {
-      content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+      content: z.string().describe("The thought to capture"),
     },
   },
   async ({ content }) => {
@@ -458,177 +266,279 @@ server.registerTool(
         extractMetadata(content),
       ]);
 
-      const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
-        p_content: content,
-        p_payload: { metadata: { ...metadata, source: "mcp" } },
-      });
+      const fp = await fingerprint(content);
+      const meta = { ...metadata, source: "mcp" };
+      const vecStr = `[${embedding.join(",")}]`;
 
-      if (upsertError) {
-        return {
-          content: [{ type: "text" as const, text: `Failed to capture: ${upsertError.message}` }],
-          isError: true,
-        };
-      }
+      const [row] = await sql`
+        INSERT INTO thoughts (content, content_fingerprint, metadata, embedding)
+        VALUES (${content}, ${fp}, ${sql.json(meta)}, ${vecStr}::vector)
+        ON CONFLICT (content_fingerprint) WHERE content_fingerprint IS NOT NULL DO UPDATE
+        SET updated_at = now(), metadata = thoughts.metadata || EXCLUDED.metadata
+        RETURNING id
+      `;
 
-      const thoughtId = upsertResult?.id;
-      const { error: embError } = await supabase
-        .from("thoughts")
-        .update({ embedding })
-        .eq("id", thoughtId);
-
-      if (embError) {
-        return {
-          content: [{ type: "text" as const, text: `Failed to save embedding: ${embError.message}` }],
-          isError: true,
-        };
-      }
-
-      const meta = metadata as Record<string, unknown>;
       let confirmation = `Captured as ${meta.type || "thought"}`;
-      if (Array.isArray(meta.topics) && meta.topics.length)
-        confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
-      if (Array.isArray(meta.people) && meta.people.length)
-        confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
-      if (Array.isArray(meta.action_items) && meta.action_items.length)
-        confirmation += ` | Actions: ${(meta.action_items as string[]).join("; ")}`;
+      if (Array.isArray(meta.topics) && meta.topics.length) confirmation += ` — ${(meta.topics as string[]).join(", ")}`;
+      if (Array.isArray(meta.people) && meta.people.length) confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
+      if (Array.isArray(meta.action_items) && meta.action_items.length) confirmation += ` | Actions: ${(meta.action_items as string[]).join("; ")}`;
+      confirmation += ` | ID: ${row.id}`;
 
-      return {
-        content: [{ type: "text" as const, text: confirmation }],
-      };
+      return { content: [{ type: "text" as const, text: confirmation }] };
     } catch (err: unknown) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
-        isError: true,
-      };
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
   }
 );
 
-// --- Hono App with Auth + CORS ---
+// Tool 5: Update Thought
+server.registerTool(
+  "update_thought",
+  {
+    title: "Update Thought",
+    description: "Update content or metadata of an existing thought.",
+    inputSchema: {
+      id: z.string().uuid().describe("The thought's UUID"),
+      content: z.string().optional().describe("New content (re-embeds if changed)"),
+      metadata_patch: z.record(z.unknown()).optional().describe("Metadata fields to merge"),
+    },
+  },
+  async ({ id, content, metadata_patch }) => {
+    try {
+      if (!content && !metadata_patch) {
+        return { content: [{ type: "text" as const, text: "Nothing to update." }] };
+      }
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-brain-key, accept, mcp-session-id, mcp-protocol-version, last-event-id",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
-};
+      if (content) {
+        const emb = await getEmbedding(content);
+        const fp = await fingerprint(content);
+        const vecStr = `[${emb.join(",")}]`;
+        await sql`UPDATE thoughts SET content = ${content}, embedding = ${vecStr}::vector, content_fingerprint = ${fp} WHERE id = ${id}::uuid`;
+      }
 
-// JSON-RPC error code for unauthorized requests.
-// Per the JSON-RPC 2.0 spec, the range -32099 to -32000 is reserved for
-// implementation-defined server errors. -32001 is the conventional
-// "Unauthorized" code used by MCP clients/servers in the wild.
-//
-// Why a JSON-RPC envelope (HTTP 200) instead of a bare HTTP 401?
-// Strict MCP hosts (Codex CLI, Claude Code) treat bare HTTP 4xx responses
-// as transport-level failures and tear the connection down rather than
-// surfacing the failure to the application layer. Wrapping the auth
-// rejection in a JSON-RPC error keeps the connection alive and lets
-// clients recover (e.g. prompt the user for a new key, refetch a stale
-// cache) instead of dying.
-const JSON_RPC_UNAUTHORIZED_CODE = -32001;
-const UNAUTHORIZED_MESSAGE = "Unauthorized: missing or invalid authentication.";
+      if (metadata_patch) {
+        const [existing] = await sql`SELECT metadata FROM thoughts WHERE id = ${id}::uuid`;
+        if (!existing) return { content: [{ type: "text" as const, text: `Thought not found.` }], isError: true };
+        const merged = { ...(existing.metadata || {}), ...metadata_patch };
+        await sql`UPDATE thoughts SET metadata = ${sql.json(merged)} WHERE id = ${id}::uuid`;
+      }
 
-/**
- * Read the request body as text without consuming the original request's
- * body stream for downstream handlers. Returns null on bodyless methods
- * or read failure.
- */
-async function readBodyText(req: Request): Promise<string | null> {
-  if (req.method === "GET" || req.method === "HEAD" || req.method === "DELETE") {
-    return null;
+      return { content: [{ type: "text" as const, text: `Thought ${id} updated.` }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
   }
-  try {
-    return await req.text();
-  } catch {
-    return null;
-  }
-}
+);
 
-/**
- * Best-effort extraction of the JSON-RPC `id` from a raw request body.
- * Returns null when the body is missing, not JSON, or not a JSON-RPC
- * shape with an id. Per the JSON-RPC 2.0 spec, id may be a string,
- * number, or null — we preserve any of those; anything else becomes null.
- */
-function extractJsonRpcId(bodyText: string | null): string | number | null {
-  if (!bodyText) return null;
-  try {
-    const parsed = JSON.parse(bodyText);
-    if (parsed && typeof parsed === "object" && "id" in parsed) {
-      const id = (parsed as { id: unknown }).id;
-      if (typeof id === "string" || typeof id === "number" || id === null) {
-        return id;
+// Tool 6: Delete Thought
+server.registerTool(
+  "delete_thought",
+  {
+    title: "Delete Thought",
+    description: "Permanently delete a thought by ID.",
+    inputSchema: {
+      id: z.string().uuid().describe("The thought's UUID"),
+    },
+  },
+  async ({ id }) => {
+    try {
+      const result = await sql`DELETE FROM thoughts WHERE id = ${id}::uuid`;
+      if (result.count === 0) {
+        return { content: [{ type: "text" as const, text: `No thought found with ID ${id}.` }] };
+      }
+      return { content: [{ type: "text" as const, text: `Thought ${id} permanently deleted.` }] };
+    } catch (err: unknown) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+// Tool 7: System Status
+server.registerTool(
+  "system_status",
+  {
+    title: "System Status",
+    description: "Get comprehensive Open Brain system health, configuration, and state.",
+    inputSchema: {},
+  },
+  async () => {
+    const lines: string[] = ["=== Open Brain System Status ===", ""];
+
+    // Server info
+    const uptimeMs = Date.now() - SERVER_START;
+    const uptimeH = Math.floor(uptimeMs / 3_600_000);
+    const uptimeM = Math.floor((uptimeMs % 3_600_000) / 60_000);
+    lines.push("## Server");
+    lines.push(`Version: 1.1.0-local`);
+    lines.push(`Port: ${MCP_PORT}`);
+    lines.push(`Uptime: ${uptimeH}h ${uptimeM}m`);
+    lines.push(`Embedding model: ${EMBEDDING_MODEL}`);
+    lines.push(`Metadata model: ${METADATA_MODEL}`);
+    lines.push("");
+
+    // Database health + stats
+    try {
+      const [stats] = await sql`
+        SELECT
+          count(*) AS total,
+          min(created_at) AS earliest,
+          max(created_at) AS latest,
+          pg_database_size('ob2d2') AS db_size
+        FROM thoughts
+      `;
+      const sizeMB = (Number(stats.db_size) / 1_048_576).toFixed(1);
+      lines.push("## Database");
+      lines.push(`Status: connected`);
+      lines.push(`Total thoughts: ${stats.total}`);
+      lines.push(`DB size: ${sizeMB} MB`);
+      if (stats.earliest) {
+        lines.push(`Earliest: ${new Date(stats.earliest).toLocaleString()}`);
+        lines.push(`Latest: ${new Date(stats.latest).toLocaleString()}`);
+      }
+
+      // Last capture details
+      const [last] = await sql`
+        SELECT content, metadata->>'source' AS source, created_at
+        FROM thoughts ORDER BY created_at DESC LIMIT 1
+      `;
+      if (last) {
+        const preview = last.content.length > 80
+          ? last.content.slice(0, 77) + "..."
+          : last.content;
+        lines.push(`Last capture: ${new Date(last.created_at).toLocaleString()} (source: ${last.source || "unknown"})`);
+        lines.push(`  "${preview}"`);
+      }
+      lines.push("");
+    } catch (err: unknown) {
+      lines.push("## Database");
+      lines.push(`Status: ERROR — ${(err as Error).message}`);
+      lines.push("");
+    }
+
+    // Ollama health
+    try {
+      const r = await fetch(`${OLLAMA_URL}/api/tags`);
+      if (r.ok) {
+        const data = await r.json();
+        const modelNames = (data.models || []).map((m: { name: string }) => m.name);
+        lines.push("## Ollama");
+        lines.push(`Status: connected`);
+        lines.push(`Models: ${modelNames.join(", ") || "none"}`);
+      } else {
+        lines.push("## Ollama");
+        lines.push(`Status: error (HTTP ${r.status})`);
+      }
+    } catch {
+      lines.push("## Ollama");
+      lines.push(`Status: unreachable`);
+    }
+    lines.push("");
+
+    // LaunchAgent status
+    lines.push("## LaunchAgents");
+    for (const label of ["com.glenl.ob2d2", "com.glenl.ob2d2-slack-bridge"]) {
+      try {
+        const cmd = new Deno.Command("launchctl", { args: ["list", label], stdout: "piped", stderr: "piped" });
+        const { code } = await cmd.output();
+        lines.push(`${label}: ${code === 0 ? "running" : "not loaded"}`);
+      } catch {
+        lines.push(`${label}: unknown (launchctl failed)`);
       }
     }
-  } catch {
-    // fall through — malformed body
-  }
-  return null;
-}
+    lines.push("");
 
-/**
- * Build a JSON-RPC 2.0 error envelope response for auth failures.
- * Returns HTTP 200 — the JSON-RPC layer expresses the error so that
- * strict MCP clients keep the connection alive instead of treating
- * the failure as a transport-level fault.
- */
-function unauthorizedResponse(id: string | number | null): Response {
-  const body = {
-    jsonrpc: "2.0",
-    error: {
-      code: JSON_RPC_UNAUTHORIZED_CODE,
-      message: UNAUTHORIZED_MESSAGE,
-    },
-    id,
-  };
-  return new Response(JSON.stringify(body), {
-    status: 200,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeaders,
-    },
-  });
+    // Type breakdown
+    try {
+      const types = await sql`
+        SELECT metadata->>'type' AS type, count(*) AS cnt
+        FROM thoughts GROUP BY metadata->>'type' ORDER BY cnt DESC
+      `;
+      if (types.length > 0) {
+        lines.push("## Thought Types");
+        for (const t of types) {
+          lines.push(`  ${t.type || "unknown"}: ${t.cnt}`);
+        }
+        lines.push("");
+      }
+    } catch { /* skip */ }
+
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+  }
+);
+
+// =====================================================================
+// HTTP Server — Hono
+// =====================================================================
+
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= 120;
 }
 
 const app = new Hono();
 
-// CORS preflight — required for browser/Electron-based clients (Claude Desktop, claude.ai)
-app.options("*", (c) => {
-  return c.text("ok", 200, corsHeaders);
+// Health endpoint (no auth)
+app.get("/health", async (c) => {
+  try {
+    const [{ count }] = await sql`SELECT count(*) FROM thoughts`;
+    let ollamaOk = false;
+    try { const r = await fetch(`${OLLAMA_URL}/api/tags`); ollamaOk = r.ok; } catch { /* */ }
+
+    return c.json({
+      status: ollamaOk ? "healthy" : "degraded",
+      db: "connected",
+      thoughts_count: Number(count),
+      ollama: ollamaOk ? "connected" : "unreachable",
+      models: { embedding: EMBEDDING_MODEL, metadata: METADATA_MODEL },
+      version: "1.1.0-local",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: unknown) {
+    return c.json({ status: "down", error: (err as Error).message }, 503);
+  }
 });
 
+// MCP handler (with auth + rate limiting)
 app.all("*", async (c) => {
-  // Accept access key via header OR URL query parameter
+  const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || "local";
+  if (!checkRateLimit(ip)) return c.json({ error: "Rate limit exceeded" }, 429);
+
   const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
   if (!provided || provided !== MCP_ACCESS_KEY) {
-    // Return a JSON-RPC 2.0 error envelope (HTTP 200) instead of a bare
-    // HTTP 401 so strict MCP hosts treat this as an application-level
-    // error rather than a transport fault and keep the connection alive.
-    // Best-effort echo of the inbound request id keeps the response
-    // correlated; malformed/missing bodies fall back to id: null.
-    const bodyText = await readBodyText(c.req.raw);
-    const id = extractJsonRpcId(bodyText);
-    return unauthorizedResponse(id);
+    return c.json({ error: "Invalid or missing access key" }, 401);
   }
 
-  // Fix: Claude Desktop connectors don't send the Accept header that
-  // StreamableHTTPTransport requires. Build a patched request if missing.
-  // See: https://github.com/NateBJones-Projects/OB1/issues/33
+  // Patch Accept header for Claude Desktop compatibility
   if (!c.req.header("accept")?.includes("text/event-stream")) {
     const headers = new Headers(c.req.raw.headers);
     headers.set("Accept", "application/json, text/event-stream");
     const patched = new Request(c.req.raw.url, {
-      method: c.req.raw.method,
-      headers,
+      method: c.req.raw.method, headers,
       body: c.req.raw.body,
-      // @ts-ignore -- duplex required for streaming body in Deno
+      // @ts-ignore
       duplex: "half",
     });
     Object.defineProperty(c.req, "raw", { value: patched, writable: true });
   }
 
+  const { StreamableHTTPTransport } = await import("npm:@hono/mcp@0.1.1");
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
   return transport.handleRequest(c);
 });
 
-Deno.serve(app.fetch);
+console.log(`OB2D2 MCP server starting on port ${MCP_PORT}...`);
+console.log(`  Database: ${DATABASE_URL.replace(/\/\/.*@/, "//***@")}`);
+console.log(`  Ollama:   ${OLLAMA_URL}`);
+console.log(`  Models:   ${EMBEDDING_MODEL} (embed), ${METADATA_MODEL} (metadata)`);
+console.log(`  Health:   http://localhost:${MCP_PORT}/health`);
+
+Deno.serve({ port: MCP_PORT }, app.fetch);
