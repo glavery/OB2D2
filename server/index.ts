@@ -483,6 +483,18 @@ function checkRateLimit(ip: string): boolean {
   return entry.count <= 120;
 }
 
+// Single long-lived MCP transport, connected once. Previously a fresh transport +
+// server.connect() ran per request, so each follow-up request (e.g. tools/list)
+// landed on an uninitialised connection — the MCP session never established and the
+// request hung until the client timed out. enableJsonResponse returns a JSON body
+// instead of an SSE stream that a per-request handler would tear down on return.
+const { StreamableHTTPTransport } = await import("npm:@hono/mcp@0.1.1");
+const mcpTransport = new StreamableHTTPTransport({
+  sessionIdGenerator: undefined,
+  enableJsonResponse: true,
+});
+await server.connect(mcpTransport);
+
 const app = new Hono();
 
 // Health endpoint (no auth)
@@ -529,10 +541,7 @@ app.all("*", async (c) => {
     Object.defineProperty(c.req, "raw", { value: patched, writable: true });
   }
 
-  const { StreamableHTTPTransport } = await import("npm:@hono/mcp@0.1.1");
-  const transport = new StreamableHTTPTransport();
-  await server.connect(transport);
-  return transport.handleRequest(c);
+  return mcpTransport.handleRequest(c);
 });
 
 console.log(`OB2D2 MCP server starting on port ${MCP_PORT}...`);
